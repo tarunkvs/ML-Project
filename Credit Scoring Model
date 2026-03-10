@@ -1,0 +1,405 @@
+# Import required libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                           f1_score, roc_auc_score, roc_curve, 
+                           confusion_matrix, classification_report)
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Part 1: Generate synthetic dataset (since we don't have real data)
+def create_sample_dataset(n_samples=1000):
+    """
+    Create a synthetic dataset for credit scoring demonstration
+    """
+    np.random.seed(42)
+    
+    # Generate features
+    data = {
+        'age': np.random.randint(22, 70, n_samples),
+        'income': np.random.normal(50000, 20000, n_samples),
+        'employment_years': np.random.randint(0, 40, n_samples),
+        'loan_amount': np.random.normal(20000, 15000, n_samples),
+        'existing_debt': np.random.normal(10000, 8000, n_samples),
+        'credit_history_length': np.random.randint(1, 20, n_samples),
+        'num_credit_cards': np.random.randint(0, 5, n_samples),
+        'late_payments_last_year': np.random.randint(0, 10, n_samples),
+        'defaulted_loans': np.random.randint(0, 3, n_samples),
+        'dependents': np.random.randint(0, 5, n_samples),
+        'education_level': np.random.choice(['High School', 'Bachelor', 'Master', 'PhD'], n_samples),
+        'employment_type': np.random.choice(['Salaried', 'Self-Employed', 'Business Owner'], n_samples)
+    }
+    
+    df = pd.DataFrame(data)
+    
+    # Create target variable based on financial health indicators
+    # Lower probability of default for good financial behavior
+    default_prob = (
+        -0.3 * (df['income'] / 10000) +
+        -0.2 * df['credit_history_length'] +
+        0.3 * df['late_payments_last_year'] +
+        0.4 * df['defaulted_loans'] +
+        0.15 * (df['existing_debt'] / 10000) +
+        -0.1 * df['employment_years'] +
+        0.2 * (df['loan_amount'] / 10000) +
+        np.random.normal(0, 0.5, n_samples)
+    )
+    
+    # Convert to probability and then to binary outcome
+    prob_default = 1 / (1 + np.exp(-default_prob))
+    df['creditworthy'] = (prob_default < 0.5).astype(int)
+    
+    # Ensure some imbalance (typically creditworthy is majority)
+    df['creditworthy'] = np.where(df['creditworthy'] == 1, 1, 
+                                  np.random.choice([0, 1], n_samples, p=[0.4, 0.6]))
+    
+    return df
+
+# Part 2: Data Preprocessing and Feature Engineering
+class CreditScoringPreprocessor:
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.label_encoders = {}
+        
+    def create_features(self, df):
+        """
+        Create additional features from existing data
+        """
+        df = df.copy()
+        
+        # Debt-to-Income Ratio
+        df['debt_to_income'] = df['existing_debt'] / (df['income'] + 1)
+        
+        # Loan-to-Income Ratio
+        df['loan_to_income'] = df['loan_amount'] / (df['income'] + 1)
+        
+        # Payment History Score
+        df['payment_history_score'] = np.where(
+            df['late_payments_last_year'] == 0, 100,
+            np.maximum(0, 100 - 10 * df['late_payments_last_year'])
+        )
+        
+        # Credit Utilization (if they have credit cards)
+        df['credit_utilization'] = df['existing_debt'] / (df['num_credit_cards'] * 5000 + 1)
+        
+        # Age groups
+        df['age_group'] = pd.cut(df['age'], 
+                                  bins=[0, 30, 45, 60, 100], 
+                                  labels=['Young', 'Middle', 'Senior', 'Elder'])
+        
+        # Stability Score (combination of employment years and age)
+        df['stability_score'] = df['employment_years'] / (df['age'] - 18 + 1)
+        
+        # Risk Score (preliminary)
+        df['preliminary_risk'] = (
+            df['late_payments_last_year'] * 10 +
+            df['defaulted_loans'] * 30 +
+            df['debt_to_income'] * 100
+        )
+        
+        return df
+    
+    def preprocess(self, df, fit=True):
+        """
+        Preprocess the data: encode categorical variables, scale numerical features
+        """
+        df = df.copy()
+        
+        # Separate features and target
+        if 'creditworthy' in df.columns:
+            y = df['creditworthy']
+            X = df.drop('creditworthy', axis=1)
+        else:
+            X = df
+            y = None
+        
+        # Identify categorical columns
+        categorical_cols = X.select_dtypes(include=['object', 'category']).columns
+        numerical_cols = X.select_dtypes(include=[np.number]).columns
+        
+        # Encode categorical variables
+        for col in categorical_cols:
+            if fit:
+                self.label_encoders[col] = LabelEncoder()
+                X[col] = self.label_encoders[col].fit_transform(X[col].astype(str))
+            else:
+                X[col] = self.label_encoders[col].transform(X[col].astype(str))
+        
+        # Scale numerical features
+        if fit:
+            X[numerical_cols] = self.scaler.fit_transform(X[numerical_cols])
+        else:
+            X[numerical_cols] = self.scaler.transform(X[numerical_cols])
+        
+        return X, y
+
+# Part 3: Model Training and Evaluation
+class CreditScoringModel:
+    def __init__(self):
+        self.models = {
+            'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),
+            'Decision Tree': DecisionTreeClassifier(random_state=42),
+            'Random Forest': RandomForestClassifier(random_state=42, n_estimators=100)
+        }
+        self.best_model = None
+        self.best_model_name = None
+        
+    def train_and_evaluate(self, X_train, X_test, y_train, y_test):
+        """
+        Train multiple models and evaluate their performance
+        """
+        results = {}
+        
+        for name, model in self.models.items():
+            # Train the model
+            model.fit(X_train, y_train)
+            
+            # Make predictions
+            y_pred = model.predict(X_test)
+            y_pred_proba = model.predict_proba(X_test)[:, 1]
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred)
+            recall = recall_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred)
+            roc_auc = roc_auc_score(y_test, y_pred_proba)
+            
+            results[name] = {
+                'model': model,
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1,
+                'roc_auc': roc_auc,
+                'y_pred': y_pred,
+                'y_pred_proba': y_pred_proba
+            }
+            
+            print(f"\n{name} Results:")
+            print(f"Accuracy: {accuracy:.4f}")
+            print(f"Precision: {precision:.4f}")
+            print(f"Recall: {recall:.4f}")
+            print(f"F1-Score: {f1:.4f}")
+            print(f"ROC-AUC: {roc_auc:.4f}")
+        
+        # Find best model based on ROC-AUC
+        best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
+        self.best_model = results[best_model_name]['model']
+        self.best_model_name = best_model_name
+        
+        return results
+    
+    def hyperparameter_tuning(self, X_train, y_train):
+        """
+        Perform hyperparameter tuning for Random Forest
+        """
+        print("\nPerforming hyperparameter tuning for Random Forest...")
+        
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 10, 20, 30],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4]
+        }
+        
+        rf = RandomForestClassifier(random_state=42)
+        grid_search = GridSearchCV(rf, param_grid, cv=5, scoring='roc_auc', n_jobs=-1)
+        grid_search.fit(X_train, y_train)
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best ROC-AUC score: {grid_search.best_score_:.4f}")
+        
+        return grid_search.best_estimator_
+
+# Part 4: Visualization Functions
+def plot_confusion_matrix(y_test, y_pred, model_name):
+    """
+    Plot confusion matrix
+    """
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.ylabel('Actual')
+    plt.xlabel('Predicted')
+    plt.show()
+
+def plot_roc_curves(y_test, results):
+    """
+    Plot ROC curves for all models
+    """
+    plt.figure(figsize=(10, 8))
+    
+    for name, result in results.items():
+        fpr, tpr, _ = roc_curve(y_test, result['y_pred_proba'])
+        plt.plot(fpr, tpr, label=f"{name} (AUC = {result['roc_auc']:.3f})")
+    
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves Comparison')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+def plot_feature_importance(model, feature_names, model_name):
+    """
+    Plot feature importance for tree-based models
+    """
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        indices = np.argsort(importances)[::-1][:15]  # Top 15 features
+        
+        plt.figure(figsize=(10, 6))
+        plt.title(f'Top 15 Feature Importances - {model_name}')
+        plt.bar(range(len(indices)), importances[indices])
+        plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=45, ha='right')
+        plt.xlabel('Features')
+        plt.ylabel('Importance')
+        plt.tight_layout()
+        plt.show()
+
+# Part 5: Main Execution
+def main():
+    # Create sample dataset
+    print("Creating sample dataset...")
+    df = create_sample_dataset(2000)
+    print(f"Dataset shape: {df.shape}")
+    print(f"\nClass distribution:")
+    print(df['creditworthy'].value_counts(normalize=True))
+    
+    # Preprocess data
+    print("\nPreprocessing data...")
+    preprocessor = CreditScoringPreprocessor()
+    
+    # Create additional features
+    df_with_features = preprocessor.create_features(df)
+    
+    # Prepare features and target
+    X, y = preprocessor.preprocess(df_with_features, fit=True)
+    
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"Training set size: {X_train.shape[0]}")
+    print(f"Test set size: {X_test.shape[0]}")
+    
+    # Train and evaluate models
+    print("\n" + "="*50)
+    print("TRAINING AND EVALUATING MODELS")
+    print("="*50)
+    
+    credit_model = CreditScoringModel()
+    results = credit_model.train_and_evaluate(X_train, X_test, y_train, y_test)
+    
+    # Perform hyperparameter tuning
+    best_rf = credit_model.hyperparameter_tuning(X_train, y_train)
+    
+    # Evaluate tuned Random Forest
+    print("\nTuned Random Forest Results:")
+    y_pred_tuned = best_rf.predict(X_test)
+    y_pred_proba_tuned = best_rf.predict_proba(X_test)[:, 1]
+    
+    print(f"Accuracy: {accuracy_score(y_test, y_pred_tuned):.4f}")
+    print(f"Precision: {precision_score(y_test, y_pred_tuned):.4f}")
+    print(f"Recall: {recall_score(y_test, y_pred_tuned):.4f}")
+    print(f"F1-Score: {f1_score(y_test, y_pred_tuned):.4f}")
+    print(f"ROC-AUC: {roc_auc_score(y_test, y_pred_proba_tuned):.4f}")
+    
+    # Visualizations
+    print("\n" + "="*50)
+    print("VISUALIZATIONS")
+    print("="*50)
+    
+    # Confusion matrix for best model
+    plot_confusion_matrix(y_test, results[credit_model.best_model_name]['y_pred'], 
+                         credit_model.best_model_name)
+    
+    # ROC curves
+    plot_roc_curves(y_test, results)
+    
+    # Feature importance for Random Forest
+    plot_feature_importance(results['Random Forest']['model'], 
+                           X.columns.tolist(), 'Random Forest')
+    
+    # Summary
+    print("\n" + "="*50)
+    print("SUMMARY")
+    print("="*50)
+    print(f"Best Model: {credit_model.best_model_name}")
+    print(f"Best ROC-AUC Score: {results[credit_model.best_model_name]['roc_auc']:.4f}")
+    
+    print("\nClassification Report for Best Model:")
+    print(classification_report(y_test, results[credit_model.best_model_name]['y_pred']))
+
+# Part 6: Credit Scoring Function
+def predict_creditworthiness(model, preprocessor, applicant_data):
+    """
+    Predict creditworthiness for new applicants
+    """
+    # Convert applicant data to DataFrame
+    df_applicant = pd.DataFrame([applicant_data])
+    
+    # Create features
+    df_applicant = preprocessor.create_features(df_applicant)
+    
+    # Preprocess
+    X_applicant, _ = preprocessor.preprocess(df_applicant, fit=False)
+    
+    # Predict
+    prediction = model.predict(X_applicant)[0]
+    probability = model.predict_proba(X_applicant)[0][1]
+    
+    return {
+        'creditworthy': bool(prediction),
+        'probability_default': 1 - probability if prediction == 1 else probability,
+        'credit_score': int(300 + (550 * probability))  # Scale to 300-850 range
+    }
+
+# Run the main function
+if __name__ == "__main__":
+    main()
+    
+    # Example of predicting for a new applicant
+    print("\n" + "="*50)
+    print("PREDICTING FOR NEW APPLICANT")
+    print("="*50)
+    
+    # Note: This part would require the trained model and preprocessor
+    # For demonstration purposes only
+    print("\nTo predict for new applicants, use the predict_creditworthiness() function")
+    print("Example:")
+    print("""
+    new_applicant = {
+        'age': 35,
+        'income': 60000,
+        'employment_years': 8,
+        'loan_amount': 25000,
+        'existing_debt': 5000,
+        'credit_history_length': 10,
+        'num_credit_cards': 2,
+        'late_payments_last_year': 0,
+        'defaulted_loans': 0,
+        'dependents': 2,
+        'education_level': 'Bachelor',
+        'employment_type': 'Salaried'
+    }
+    
+    result = predict_creditworthiness(best_model, preprocessor, new_applicant)
+    print(f"Creditworthy: {result['creditworthy']}")
+    print(f"Probability of Default: {result['probability_default']:.2%}")
+    print(f"Credit Score: {result['credit_score']}")
+    """)
