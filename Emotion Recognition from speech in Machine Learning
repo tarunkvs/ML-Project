@@ -1,0 +1,697 @@
+# Import required libraries
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import librosa
+import librosa.display
+import warnings
+warnings.filterwarnings('ignore')
+
+# Deep learning libraries
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import joblib
+
+# For audio processing
+import soundfile as sf
+from IPython.display import Audio
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Part 1: Feature Extraction Class
+class AudioFeatureExtractor:
+    """
+    Extract features from audio files for emotion recognition
+    """
+    def __init__(self, n_mfcc=40, n_fft=2048, hop_length=512, n_mels=128, fixed_length=100):
+        self.n_mfcc = n_mfcc
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.fixed_length = fixed_length  # Fixed time steps for padding/truncation
+        
+    def extract_features(self, audio_path):
+        """
+        Extract MFCC, Mel-spectrogram, and other features from audio file
+        """
+        try:
+            # Load audio file
+            audio, sr = librosa.load(audio_path, sr=16000)  # Resample to 16kHz
+            
+            # Extract MFCCs
+            mfccs = librosa.feature.mfcc(
+                y=audio, sr=sr, n_mfcc=self.n_mfcc,
+                n_fft=self.n_fft, hop_length=self.hop_length
+            )
+            
+            # Extract Mel-spectrogram
+            mel_spec = librosa.feature.melspectrogram(
+                y=audio, sr=sr, n_mels=self.n_mels,
+                n_fft=self.n_fft, hop_length=self.hop_length
+            )
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            
+            # Extract additional features
+            # Chroma features (pitch classes)
+            chroma = librosa.feature.chroma_stft(
+                y=audio, sr=sr, n_chroma=12,
+                n_fft=self.n_fft, hop_length=self.hop_length
+            )
+            
+            # Spectral contrast
+            contrast = librosa.feature.spectral_contrast(
+                y=audio, sr=sr, n_bands=6,
+                n_fft=self.n_fft, hop_length=self.hop_length
+            )
+            
+            # Zero crossing rate
+            zcr = librosa.feature.zero_crossing_rate(audio, hop_length=self.hop_length)
+            
+            # RMS energy
+            rms = librosa.feature.rms(y=audio, hop_length=self.hop_length)
+            
+            # Pitch (fundamental frequency)
+            pitches, magnitudes = librosa.piptrack(y=audio, sr=sr)
+            
+            # Pad or truncate to fixed length
+            features = {
+                'mfcc': self._pad_truncate(mfccs),
+                'mel_spec': self._pad_truncate(mel_spec_db),
+                'chroma': self._pad_truncate(chroma),
+                'contrast': self._pad_truncate(contrast),
+                'zcr': self._pad_truncate(zcr),
+                'rms': self._pad_truncate(rms)
+            }
+            
+            return features, sr
+            
+        except Exception as e:
+            print(f"Error processing {audio_path}: {str(e)}")
+            return None, None
+    
+    def _pad_truncate(self, feature):
+        """
+        Pad or truncate feature to fixed length
+        """
+        if feature.shape[1] > self.fixed_length:
+            # Truncate
+            return feature[:, :self.fixed_length]
+        else:
+            # Pad
+            pad_width = ((0, 0), (0, self.fixed_length - feature.shape[1]))
+            return np.pad(feature, pad_width, mode='constant')
+    
+    def extract_all_features(self, audio_path):
+        """
+        Extract and concatenate all features
+        """
+        features, sr = self.extract_features(audio_path)
+        if features is None:
+            return None
+        
+        # Concatenate all features along frequency axis
+        all_features = np.vstack([
+            features['mfcc'],
+            features['mel_spec'][:self.n_mfcc, :],  # Take only first n_mfcc bands
+            features['chroma'],
+            features['contrast'],
+            features['zcr'],
+            features['rms']
+        ])
+        
+        return all_features.T  # Return as (time_steps, features)
+
+# Part 2: Synthetic Dataset Generator (for demonstration)
+def generate_synthetic_emotion_data(n_samples=500):
+    """
+    Generate synthetic emotion data for demonstration purposes
+    In real application, you would load actual audio files
+    """
+    np.random.seed(42)
+    
+    emotions = ['happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised', 'neutral']
+    n_emotions = len(emotions)
+    
+    # Create synthetic features
+    X = []
+    y = []
+    
+    for i in range(n_samples):
+        emotion_idx = i % n_emotions
+        emotion = emotions[emotion_idx]
+        
+        # Generate synthetic MFCC-like features with emotion-specific patterns
+        if emotion == 'happy':
+            # Higher pitch, more variation
+            features = np.random.normal(0.5, 0.3, (100, 80))
+        elif emotion == 'sad':
+            # Lower pitch, less variation
+            features = np.random.normal(-0.5, 0.2, (100, 80))
+        elif emotion == 'angry':
+            # High energy, harsh tones
+            features = np.random.normal(0.8, 0.4, (100, 80))
+        elif emotion == 'fearful':
+            # Irregular patterns
+            features = np.random.normal(0.2, 0.5, (100, 80))
+        else:
+            features = np.random.normal(0, 0.3, (100, 80))
+        
+        X.append(features)
+        y.append(emotion)
+    
+    return np.array(X), np.array(y), emotions
+
+# Part 3: Deep Learning Models
+def create_cnn_model(input_shape, n_classes):
+    """
+    Create CNN model for emotion recognition
+    """
+    model = models.Sequential([
+        # First convolutional block
+        layers.Conv1D(64, kernel_size=3, activation='relu', padding='same', input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.3),
+        
+        # Second convolutional block
+        layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.3),
+        
+        # Third convolutional block
+        layers.Conv1D(256, kernel_size=3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.GlobalAveragePooling1D(),
+        layers.Dropout(0.4),
+        
+        # Dense layers
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.4),
+        layers.Dense(64, activation='relu'),
+        layers.Dropout(0.3),
+        
+        # Output layer
+        layers.Dense(n_classes, activation='softmax')
+    ])
+    
+    return model
+
+def create_lstm_model(input_shape, n_classes):
+    """
+    Create LSTM model for emotion recognition
+    """
+    model = models.Sequential([
+        # First LSTM layer
+        layers.LSTM(128, return_sequences=True, input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        # Second LSTM layer
+        layers.LSTM(64, return_sequences=True),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        # Third LSTM layer
+        layers.LSTM(32, return_sequences=False),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        # Dense layers
+        layers.Dense(64, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        # Output layer
+        layers.Dense(n_classes, activation='softmax')
+    ])
+    
+    return model
+
+def create_cnn_lstm_model(input_shape, n_classes):
+    """
+    Create hybrid CNN-LSTM model for emotion recognition
+    """
+    model = models.Sequential([
+        # CNN layers for feature extraction
+        layers.Conv1D(64, kernel_size=3, activation='relu', padding='same', input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.3),
+        
+        layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.3),
+        
+        # LSTM layers for temporal dependencies
+        layers.LSTM(128, return_sequences=True),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        layers.LSTM(64, return_sequences=False),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        # Dense layers
+        layers.Dense(64, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        layers.Dense(32, activation='relu'),
+        layers.Dropout(0.2),
+        
+        # Output layer
+        layers.Dense(n_classes, activation='softmax')
+    ])
+    
+    return model
+
+# Part 4: Training and Evaluation Class
+class EmotionRecognizer:
+    def __init__(self, input_shape, n_classes, emotion_labels):
+        self.input_shape = input_shape
+        self.n_classes = n_classes
+        self.emotion_labels = emotion_labels
+        self.models = {
+            'CNN': create_cnn_model(input_shape, n_classes),
+            'LSTM': create_lstm_model(input_shape, n_classes),
+            'CNN-LSTM': create_cnn_lstm_model(input_shape, n_classes)
+        }
+        self.histories = {}
+        self.best_model = None
+        self.best_model_name = None
+        self.label_encoder = LabelEncoder()
+        
+    def compile_models(self, learning_rate=0.001):
+        """
+        Compile all models
+        """
+        optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        
+        for name, model in self.models.items():
+            model.compile(
+                optimizer=optimizer,
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+            print(f"{name} model compiled successfully")
+    
+    def train_model(self, model_name, X_train, y_train, X_val, y_val, epochs=50, batch_size=32):
+        """
+        Train a specific model
+        """
+        if model_name not in self.models:
+            raise ValueError(f"Model {model_name} not found")
+        
+        model = self.models[model_name]
+        
+        # Callbacks
+        early_stopping = callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True
+        )
+        
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=0.00001
+        )
+        
+        model_checkpoint = callbacks.ModelCheckpoint(
+            f'best_{model_name}_model.h5',
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max'
+        )
+        
+        # Train the model
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[early_stopping, reduce_lr, model_checkpoint],
+            verbose=1
+        )
+        
+        self.histories[model_name] = history
+        return history
+    
+    def train_all_models(self, X_train, y_train, X_val, y_val, epochs=50, batch_size=32):
+        """
+        Train all models
+        """
+        results = {}
+        
+        for name in self.models.keys():
+            print(f"\n{'='*50}")
+            print(f"Training {name} model...")
+            print('='*50)
+            
+            history = self.train_model(name, X_train, y_train, X_val, y_val, epochs, batch_size)
+            
+            # Evaluate on validation set
+            val_loss, val_acc = self.models[name].evaluate(X_val, y_val, verbose=0)
+            results[name] = {
+                'val_loss': val_loss,
+                'val_accuracy': val_acc,
+                'history': history
+            }
+            
+            print(f"{name} - Validation Accuracy: {val_acc:.4f}")
+        
+        # Find best model
+        self.best_model_name = max(results, key=lambda x: results[x]['val_accuracy'])
+        self.best_model = self.models[self.best_model_name]
+        
+        print(f"\nBest Model: {self.best_model_name} with accuracy: {results[self.best_model_name]['val_accuracy']:.4f}")
+        
+        return results
+    
+    def evaluate(self, X_test, y_test):
+        """
+        Evaluate all models on test set
+        """
+        results = {}
+        
+        for name, model in self.models.items():
+            # Make predictions
+            y_pred_proba = model.predict(X_test)
+            y_pred = np.argmax(y_pred_proba, axis=1)
+            y_true = np.argmax(y_test, axis=1)
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_true, y_pred)
+            report = classification_report(y_true, y_pred, target_names=self.emotion_labels, output_dict=True)
+            
+            results[name] = {
+                'accuracy': accuracy,
+                'predictions': y_pred,
+                'probabilities': y_pred_proba,
+                'report': report
+            }
+            
+            print(f"\n{name} Model Results:")
+            print(f"Test Accuracy: {accuracy:.4f}")
+            
+        return results
+    
+    def predict_emotion(self, audio_features):
+        """
+        Predict emotion from audio features
+        """
+        if self.best_model is None:
+            raise ValueError("No trained model available")
+        
+        # Ensure correct shape
+        if len(audio_features.shape) == 2:
+            audio_features = np.expand_dims(audio_features, axis=0)
+        
+        # Predict
+        predictions = self.best_model.predict(audio_features)
+        emotion_idx = np.argmax(predictions[0])
+        confidence = predictions[0][emotion_idx]
+        
+        return {
+            'emotion': self.emotion_labels[emotion_idx],
+            'confidence': float(confidence),
+            'all_probabilities': dict(zip(self.emotion_labels, predictions[0]))
+        }
+
+# Part 5: Visualization Functions
+def plot_training_history(histories):
+    """
+    Plot training history for all models
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    for idx, (name, history) in enumerate(histories.items()):
+        row, col = idx // 2, idx % 2
+        
+        # Plot accuracy
+        axes[row, col].plot(history.history['accuracy'], label='Train Accuracy')
+        axes[row, col].plot(history.history['val_accuracy'], label='Validation Accuracy')
+        axes[row, col].set_title(f'{name} - Accuracy')
+        axes[row, col].set_xlabel('Epochs')
+        axes[row, col].set_ylabel('Accuracy')
+        axes[row, col].legend()
+        axes[row, col].grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Plot loss separately
+    plt.figure(figsize=(15, 5))
+    for name, history in histories.items():
+        plt.plot(history.history['loss'], label=f'{name} - Train Loss')
+        plt.plot(history.history['val_loss'], '--', label=f'{name} - Val Loss')
+    
+    plt.title('Model Loss Comparison')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_confusion_matrices(y_true, predictions_dict, emotion_labels):
+    """
+    Plot confusion matrices for all models
+    """
+    n_models = len(predictions_dict)
+    fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 4))
+    
+    if n_models == 1:
+        axes = [axes]
+    
+    for idx, (name, y_pred) in enumerate(predictions_dict.items()):
+        cm = confusion_matrix(y_true, y_pred)
+        
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=emotion_labels, 
+                   yticklabels=emotion_labels,
+                   ax=axes[idx])
+        axes[idx].set_title(f'{name} - Confusion Matrix')
+        axes[idx].set_xlabel('Predicted')
+        axes[idx].set_ylabel('True')
+    
+    plt.tight_layout()
+    plt.show()
+
+def plot_model_comparison(results):
+    """
+    Plot model comparison
+    """
+    models = list(results.keys())
+    accuracies = [results[m]['accuracy'] for m in models]
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(models, accuracies, color=['skyblue', 'lightcoral', 'lightgreen'])
+    plt.title('Model Accuracy Comparison')
+    plt.xlabel('Models')
+    plt.ylabel('Test Accuracy')
+    plt.ylim([0, 1])
+    
+    # Add value labels on bars
+    for bar, acc in zip(bars, accuracies):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{acc:.3f}', ha='center', va='bottom')
+    
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.show()
+
+# Part 6: Main Execution
+def main():
+    print("="*60)
+    print("EMOTION RECOGNITION FROM SPEECH")
+    print("="*60)
+    
+    # Part 1: Generate or load data
+    print("\n1. Loading/Generating data...")
+    
+    # For demonstration, we'll use synthetic data
+    # In real application, replace this with actual audio data loading
+    X, y, emotion_labels = generate_synthetic_emotion_data(n_samples=1000)
+    
+    print(f"Data shape: {X.shape}")
+    print(f"Emotions: {emotion_labels}")
+    
+    # Part 2: Preprocess data
+    print("\n2. Preprocessing data...")
+    
+    # Encode labels
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(y)
+    y_categorical = to_categorical(y_encoded)
+    
+    # Split data
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y_categorical, test_size=0.3, random_state=42, stratify=y_encoded
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=np.argmax(y_temp, axis=1)
+    )
+    
+    print(f"Training set: {X_train.shape}")
+    print(f"Validation set: {X_val.shape}")
+    print(f"Test set: {X_test.shape}")
+    
+    # Part 3: Create and train models
+    print("\n3. Creating and training models...")
+    
+    input_shape = (X.shape[1], X.shape[2])  # (time_steps, features)
+    n_classes = len(emotion_labels)
+    
+    recognizer = EmotionRecognizer(input_shape, n_classes, emotion_labels)
+    recognizer.compile_models(learning_rate=0.001)
+    
+    # Train all models
+    results = recognizer.train_all_models(
+        X_train, y_train, X_val, y_val,
+        epochs=30,  # Reduced for demonstration
+        batch_size=32
+    )
+    
+    # Part 4: Evaluate models
+    print("\n4. Evaluating models on test set...")
+    test_results = recognizer.evaluate(X_test, y_test)
+    
+    # Part 5: Visualizations
+    print("\n5. Generating visualizations...")
+    
+    # Plot training history
+    plot_training_history(recognizer.histories)
+    
+    # Plot model comparison
+    plot_model_comparison(test_results)
+    
+    # Plot confusion matrices
+    y_true = np.argmax(y_test, axis=1)
+    predictions_dict = {
+        name: test_results[name]['predictions']
+        for name in test_results.keys()
+    }
+    plot_confusion_matrices(y_true, predictions_dict, emotion_labels)
+    
+    # Part 6: Example prediction
+    print("\n6. Example prediction...")
+    
+    # Take a sample from test set
+    sample_idx = 0
+    sample_features = X_test[sample_idx]
+    true_emotion = emotion_labels[np.argmax(y_test[sample_idx])]
+    
+    # Predict
+    prediction = recognizer.predict_emotion(sample_features)
+    
+    print(f"\nTrue Emotion: {true_emotion}")
+    print(f"Predicted Emotion: {prediction['emotion']}")
+    print(f"Confidence: {prediction['confidence']:.2%}")
+    print("\nAll probabilities:")
+    for emotion, prob in prediction['all_probabilities'].items():
+        print(f"  {emotion}: {prob:.2%}")
+    
+    # Part 7: Save models
+    print("\n7. Saving best model...")
+    
+    # Save the best model
+    recognizer.best_model.save('best_emotion_recognition_model.h5')
+    
+    # Save label encoder
+    joblib.dump(label_encoder, 'label_encoder.pkl')
+    
+    print(f"Best model ({recognizer.best_model_name}) saved successfully!")
+    
+    return recognizer, test_results
+
+# Part 7: Real-time emotion recognition function
+def real_time_emotion_recognition(audio_file_path, model, feature_extractor, label_encoder):
+    """
+    Recognize emotion from an audio file in real-time
+    """
+    # Extract features
+    features = feature_extractor.extract_all_features(audio_file_path)
+    
+    if features is None:
+        print("Error processing audio file")
+        return None
+    
+    # Reshape for model input
+    features = np.expand_dims(features, axis=0)
+    
+    # Predict
+    predictions = model.predict(features)
+    emotion_idx = np.argmax(predictions[0])
+    confidence = predictions[0][emotion_idx]
+    
+    # Decode emotion
+    emotion = label_encoder.inverse_transform([emotion_idx])[0]
+    
+    return {
+        'emotion': emotion,
+        'confidence': confidence,
+        'all_probabilities': dict(zip(label_encoder.classes_, predictions[0]))
+    }
+
+# Part 8: Audio processing pipeline for real data
+def process_audio_dataset(audio_dir, feature_extractor):
+    """
+    Process a directory of audio files for training
+    """
+    X = []
+    y = []
+    file_paths = []
+    
+    # Assuming directory structure: audio_dir/emotion/*.wav
+    for emotion_folder in os.listdir(audio_dir):
+        emotion_path = os.path.join(audio_dir, emotion_folder)
+        
+        if os.path.isdir(emotion_path):
+            for audio_file in os.listdir(emotion_path):
+                if audio_file.endswith(('.wav', '.mp3', '.ogg')):
+                    audio_path = os.path.join(emotion_path, audio_file)
+                    
+                    # Extract features
+                    features = feature_extractor.extract_all_features(audio_path)
+                    
+                    if features is not None:
+                        X.append(features)
+                        y.append(emotion_folder)
+                        file_paths.append(audio_path)
+                        
+                        print(f"Processed: {audio_file}")
+    
+    return np.array(X), np.array(y), file_paths
+
+if __name__ == "__main__":
+    # Run the main function
+    recognizer, results = main()
+    
+    print("\n" + "="*60)
+    print("EMOTION RECOGNITION SYSTEM READY")
+    print("="*60)
+    print("\nTo use with real audio files:")
+    print("""
+    # Initialize feature extractor
+    extractor = AudioFeatureExtractor()
+    
+    # Extract features from audio file
+    features = extractor.extract_all_features('path_to_audio.wav')
+    
+    # Predict emotion
+    result = recognizer.predict_emotion(features)
+    print(f"Detected emotion: {result['emotion']}")
+    print(f"Confidence: {result['confidence']:.2%}")
+    """)
